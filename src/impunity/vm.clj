@@ -1,8 +1,8 @@
 (ns impunity.vm
-  (:require [clojure.algo.monads :refer :all]
+  (:require [impunity.asm :refer [load-method class-by-name]]
             [impunity.utils :refer :all]
             [impunity.monad :refer :all])
-  (:import [impunity.monad Choice]))
+  (:import  [impunity.monad Choice]))
 
 ;; VM interface
 (defprotocol IRead
@@ -11,13 +11,6 @@
     [vm]
     [vm i]))
 
-(defprotocol IOperation
-  (operation
-    [vm op a b]
-    [vm op a]))
-
-(defprotocol ICondition
-  (condition  [vm cond]))
 
 (defprotocol IWrite
   (new-obj         [vm obj])
@@ -29,152 +22,190 @@
     [vm]
     [vm i]))
 
-(defprotocol IJump
+(defprotocol IOperation
+  (operation
+    [vm op a b]
+    [vm op a]))
+
+(defprotocol ICondition
+  (record [vm condition]))
+
+(defprotocol IControl
+  (step   [vm])
+  (return [vm])
+  (check
+    [vm ex cond a]
+    [vm ex cond a b])
+
+  (jump
+    [vm label]
+    [vm label cond a]
+    [vm label cond a b])
+  
   (invoke [vm method args])
   (athrow [vm ex]))
 
 (declare run)
 
-(def class-db (atom {}))
-
-(defn get-method [owner name desc]
-  (let [class  (get-in @class-db owner)
-        method (get class name)]
-    method))
-
 ;; VM Instructions
-(defn throw-exception [vm]
-  (not-implemented! "throw-exception"))
+(defn exception [class-name]
+  {::type class-name})
 
-(defn proc2with [vm f2]
-  (let [[a b]  (peek-stack vm 2)]
-    (m-> vm
-         (pop-stack 2)
-         (operation f2 a b))))
+(defmulti  play  (fn [vm insn]
+                   (first insn)))
 
-(defn proc1with [vm f1]
-  (let [a      (peek-stack vm)]
-    (m-> vm
-          (pop-stack)
-          (operation f1 a))))
+(defmethod play :default
+  [vm [nmonic]]
+  (not-implemented! nmonic))
 
-(defmulti  heap-op  (fn [vm insn] (first insn)))
+(doseq [insn-name [:label
+                   :frame
+                   :linenumber
+                   :nop]]
+  (defmethod play insn-name
+    [vm _]
+    vm))
 
-(defmethod heap-op  :arraylength
+;; Heap Ops
+(defmethod play  :arraylength
   [vm _]
   (let [array (get-mem vm (peek-stack vm) :vm/length)]
     (m-> vm
-          pop-stack
-          (push-stack (:length array)))))
+         (pop-stack)
+         (check (exception "java/lang/NullPointerException")
+                :nonnull array)
+         (push-stack (:length array)))))
 
-(defmethod heap-op  :newarray
+(defmethod play  :newarray
   [vm [_ operand]]
-  (new-obj vm {::type   :array
-               ::length operand}))
+  (m-> vm
+       (check (exception "java/lang/NegativeArraySizeException")
+              :cmpge operand 0)
+       (new-obj {::type   :array
+                 ::length operand})))
 
-(defmethod heap-op :new
+(defmethod play :new
   [vm [_ desc]]
   (new-obj vm {::type desc}))
 
-(defmethod heap-op :anewarray
+(defmethod play :anewarray
   [vm [_ desc]]
+  (let [operand (peek-stack vm)]
+    (m-> vm
+         (pop-stack)
+         (check (exception "java/lang/NegativeArraySizeException")
+                :cmpge operand 0)
+         (new-obj {::type   desc
+                   ::length operand}))))
+
+(defmethod play :getstatic
+  [vm [_ class-name field-name desc]]
+  (push-stack vm
+        (get-mem vm class-name field-name)))
+
+(defmethod play :putstatic
+  [vm [_ class-name field-name desc]]
   (m-> vm
         (pop-stack)
-        (new-obj {::type   desc
-                  ::length (peek-stack vm)})))
+        (set-mem class-name field-name (peek-stack vm))))
 
-(defmethod heap-op :getstatic
-  [vm [_ owner name desc]]
-  (push-stack vm
-        (get-mem vm owner name)))
+(defmethod play :getfield
+  [vm [_ class-name field-name desc]]
+  (let [obj (peek-stack vm)]
+    (m-> vm
+         (pop-stack)
+         (push-stack (get-mem vm
+                              obj
+                              field-name)))))
 
-(defmethod heap-op :putstatic
-  [vm [_ owner name desc]]
-  (m-> vm
-        (pop-stack)
-        (set-mem owner name (peek-stack vm))))
-
-(defmethod heap-op :getfield
-  [vm [_ owner name desc]]
-  (push-stack vm
-        (get-mem vm (peek-stack vm) name)))
-
-(defmethod heap-op :putfield
-  [vm [_ owner name desc]]
+(defmethod play :putfield
+  [vm [_ class-name field-name desc]]
   (let [[v ref] (peek-stack vm 2)]
     (m-> vm
           (pop-stack 2)
-          (set-mem ref name v))))
+          (set-mem ref field-name v))))
 
-(defmethod heap-op :load
+(defmethod play :load
   [vm [_ var desc]]
    (push-stack vm (get-mem vm :local var)))
 
-(defmethod heap-op :store
+(defmethod play :store
   [vm [_ var desc]]
   (m-> vm
         (pop-stack)
         (set-mem :local var (peek-stack vm))))
 
-(defmethod heap-op :aload
+(defmethod play :aload
   [vm [_ desc]]
   (let [[i array] (peek-stack vm 2)]
     (m-> vm
-          (pop-stack  2)
-          (push-stack (get-mem vm array i)))))
+         (pop-stack  2)
+         (check (exception "java/lang/NullPointerException")
+                :nonnull array)
+         (check (exception "java/lang/ArrayIndexOutOfBoundsException")
+                :cmpg (::lenght array) i)
+         (push-stack (get-mem vm array i)))))
 
-(defmethod heap-op :astore
+(defmethod play :astore
   [vm [_ desc]]
-  (let [[val i ref] (peek-stack vm 3)]
+  (let [[val i array] (peek-stack vm 3)]
     (m-> vm
-          (pop-stack 3)
-          (set-mem ref i val))))
+         (pop-stack 3)
+         (check (exception "java/lang/NullPointerException")
+                :nonnull array)
+         (check (exception "java/lang/ArrayIndexOutOfBoundsException")
+                :cmpg (::length array) i)
+         (set-mem array i val))))
 
-(defmulti  control-op (fn [vm [nmonic] method pc]
-                        nmonic))
+;; Control Ops
+;; TODO implement :monitor
+(defmethod play :athrow
+  [vm _]
+  ;; TODO check monitor
+  (let [ex (peek-stack vm)]
+    (m-> vm
+         (check (exception "java/lang/NullPointerException")
+                :nonnull ex)
+         (athrow ex))))
 
-(defmethod control-op :athrow
-  [vm _ _ _]
-  (not-implemented! "athrow"))
-
-(defmethod control-op :monitor
-  [vm _ _ _]
-  (not-implemented! "monitor"))
-
-(defmethod control-op :ret
-  [vm [_ var desc] _ _]
-  (not-implemented! "RET"))
-
-(defmethod control-op :return
-  [vm [_ desc] _ _]
+(defmethod play :return
+  [vm [_ desc]]
+  ;; TODO implement monitor check
   (if (= desc :V)
-    (clear-stack vm)
     (m-> vm
          (clear-stack)
-         (push-stack (peek-stack vm)))))
-
-(defmethod control-op :invoke
-  [vm [_ kind owner name [ret args] :as insn] _ _]
-  (let [method     (get-method  owner name [ret args])
-        args-count (case kind
-                     :static (count args)
-                     (inc (count args)))]
+         (return))
     (m-> vm
-          (pop-stack args-count) 
-          (invoke insn
-                  (peek-stack vm args-count)))))
+         (clear-stack)
+         (push-stack (peek-stack vm))
+         (return))))
+
+(defmethod play :invoke
+  [vm [_ kind class-name method-name [ret args]]]
+  (let [method     (load-method  class-name method-name args)
+        args-count (count args)]
+    (if (= kind :static)
+      (m-> vm
+           (pop-stack args-count) 
+           (invoke method (peek-stack vm args-count)))
+      (let [args-count      (inc args-count)
+            [this :as args] (peek-stack vm args-count)]
+        (m-> vm
+             (pop-stack args-count)
+             (check (exception "java/lang/NullPointerException")
+                    :nonnull this)
+             (invoke method args))))))
 
 
-(defmethod control-op :checkcast
-  [vm [_ desc] method pc]
+(defmethod play :checkcast
+  [vm [_ desc]]
   (let [ref    (peek-stack vm)]
-    (plus (condition vm   [true :instanceof desc ref])
-          (delay (m-> vm
-                      (condition [false :instanceof desc ref])
-                      (athrow {::type ClassCastException}))))))
+    (m-> vm
+         (check (exception "java/lang/ClassCastException")
+                :instanceof desc ref))))
 
-(defmethod control-op :if
-  [vm [_ label cmp maybe-dec] method pc]
+(defmethod play :if
+  [vm [_ label cmp maybe-dec]]
   (case cmp
     (:eq 
      :ne 
@@ -184,15 +215,8 @@
      :le
      :null
      :nonnull)
-    (let [a      (peek-stack vm)
-          result (operation vm cmp a)
-          vm     (pop-stack vm)]
-      (plus (m-> vm
-                 (condition [false result cmp a])
-                 (run method (inc pc)))
-            (delay (m-> vm
-                        (condition [true result cmp a])
-                        (run method label)))))
+    (let [a (peek-stack vm)]
+      (jump vm label cmp a))
     
     (:cmpeq 
      :cmpne 
@@ -200,60 +224,38 @@
      :cmpge 
      :cmpgt 
      :cmple)
-    (let [[a b]  (peek-stack vm 2)
-          result (operation vm cmp a b)
-          vm     (pop-stack vm 2)]
-      (plus (m-> vm
-                 (condition [false result cmp a b])
-                 (run method (inc pc)))
-            (delay (m-> vm
-                        (condition [true result cmp a b])
-                        (run method label)))))
+    (let [[a b]  (peek-stack vm 2)]
+      (jump vm label cmp a b))
 
-    :goto    (if (> label pc)
-               (delay (run vm method label))
-               (assoc vm :loop true))
+    :goto    (jump vm label)
     :jsr     (not-implemented! "JSR")))
 
-(defmulti  stack-op   (fn [vm insn] (first insn)))
 
-(defmethod stack-op :default
-  [vm [name]]
-  (not-implemented! name))
-
-(doseq [insn-name [:label
-                   :frame
-                   :linenumber
-                   :nop
-                   :2]]
-  (defmethod stack-op insn-name
-    [vm _]
-    vm))
-
-(defmethod stack-op :bipush
+;; StackOps
+(defmethod play :bipush
   [vm [_ operand]]
   (push-stack vm operand))
 
-(defmethod stack-op :sipush
+(defmethod play :sipush
   [vm [_ operand]]
   (push-stack vm operand))
 
-(defmethod stack-op :instanceof
+(defmethod play :instanceof
   [vm [_ desc]]
   (let [a  (peek-stack vm)]
     (m-> vm
           (pop-stack)
           (operation :instanceof desc a))))
 
-(defmethod stack-op :const
+(defmethod play :const
   [vm [_ val desc]]
   (push-stack vm val))
 
-(defmethod stack-op :pop
+(defmethod play :pop
   [vm [_ times]]
   (pop-stack vm times))
 
-(defmethod stack-op :dup
+(defmethod play :dup
   [vm [_ depth]]
   (let [dup   (peek-stack vm)
         head  (peek-stack vm depth)]
@@ -262,7 +264,7 @@
           (push-stack dup)
           (push-stack-many head))))
 
-(defmethod stack-op :dup2
+(defmethod play :dup2
   [vm [_ depth]]
   (let [dups (peek-stack vm 2)
         head (peek-stack vm depth)]
@@ -271,12 +273,19 @@
           (push-stack-many dups)
           (push-stack-many head))))
 
-(defmethod stack-op :swap
+(defmethod play :swap
   [vm _]
   (let [[v1 v2] (peek-stack vm 2)]
     (m-> vm
           (pop-stack 2)
           (push-stack-many [v2 v1]))))
+
+
+(defn proc2with [vm f2]
+  (let [[a b]  (peek-stack vm 2)]
+    (m-> vm
+         (pop-stack 2)
+         (operation f2 a b))))
 
 (doseq [op [:add
             :and
@@ -294,56 +303,67 @@
             :ushr
             :xor
             :add]]
-  (defmethod stack-op op
+  (defmethod play op
     [vm [op]]
     (proc2with vm op)))
 
-(defmethod stack-op :new
+(defmethod play :neg
   [vm _]
-  (proc1with vm :neg))
+  (let [a (peek-stack vm)]
+    (m-> vm
+         (pop-stack)
+         (operation :neg a))))
 
 (defrecord VirtualMachine [heap
-                           local                           
+                           method
                            stack
-                           events
+                           exception
+                           conditions
                            border?]
   IRead
   (get-mem [vm ref i]
     (if (= ref :local)
-      (get local i)
-      (get-in heap [ref i])))
+      (get-in vm [:method :local i])
+      (get-in vm [:heap   ref i])))
 
   (peek-stack [vm]
-    (peek stack))
+    (peek (:stack method)))
   
   (peek-stack [vm i]
-    (take i stack))
+    (take i (:stack method)))
 
   IWrite
   (new-obj [vm obj]
-    (let [i (gen-id)]
+    (let [i (lvar (::type obj))]
       (push-stack (assoc-in vm [:heap i] obj)
                   i)))
   
   (set-mem  [vm ref i v]
     (if (= ref :local)
-      (assoc-in vm [:local i] v)
-      (assoc-in vm [:heap i] v)))
+      (assoc-in vm
+                [:method :local i] v)
+      (assoc-in vm
+                [:heap  i] v)))
   
   (push-stack [vm v]
-    (assoc vm :stack (conj stack v)))
+    (update-in vm
+               [:method :stack] conj v))
   
   (push-stack-many [vm vs]
-    (assoc vm :stack (apply list (concat vs stack))))
+    (update-in vm
+               [:method :stack] #(apply list (concat vs %))))
 
   (pop-stack [vm]
-    (assoc vm :stack (pop stack)))
+    (update-in vm
+               [:method :stack] pop))
 
   (pop-stack [vm i]
-    (assoc vm :stack (apply list (drop i stack))))
+    (update-in vm
+               [:method :stack] #(apply list (drop i %))))
 
   (clear-stack [vm]
-    (assoc vm :stack '()))
+    (assoc-in vm
+              [:method :stack] '()))
 
   ICondition
   (condition [vm cond]
@@ -351,70 +371,181 @@
 
   IOperation
   (operation [vm op a]
-    (lvar))
+    (if (lvar? a)
+      (lvar)
+      (case op
+        :neg  (- a)
+        :eq   (= a 0)
+        :ne   (not= a 0)
+        :lt   (< a 0)
+        :le   (<= a 0)
+        :ge   (>= a 0)
+        :gt   (> a 0)
+        :null (= nil a)
+        :nonnull  (not= nil a)
+        :cast   a)))
   
   (operation [vm op a b]
-    (lvar))
+    (if (or (lvar? a)
+            (lvar? b))
+      (lvar)
+      (case op
+        :add (+ a b)  
+        :sub (- a b)
+        :mul (* a b)
+        :div (/ a b)
+        :rem (rem a b)
+        :shl (bit-shift-left a b)
+        :shr (bit-shift-right a b)
+        :ushr (unsigned-bit-shift-right a b)
+        :and (bit-and a b)
+        :or (bit-or a b)
+        :xor (bit-xor a b)
+        :cmp (= a b)
+        :cmpl (< a b)
+        :cmple (<= a b)
+        :cmpg (> a b)
+        :cmpge (>= a b))))
 
-  IJump
-  (invoke [caller method args]
-    (if (border? method)
+  ICondition
+  (record [vm condition]
+    (update vm :conditions conj condition))
+  
+  IControl
+  (step   [vm]
+    (let [{pc    :pc
+           insns :method/instructions} method]
+      (if-let [insn (and (< pc (count insns))
+                         (nth insns pc))]
+        (m-> vm
+             (play insn)
+             (update-in [:method :pc] inc))
+        vm)))
+  
+  (check [vm ex cond a]
+    (let [result (operation vm cond a)]
+      (case result
+        true  vm
+        false (athrow vm ex)
+        (plus (record vm [true cond a])
+              (m-> vm
+                   (record [false cond a])
+                   (athrow ex))))))
+  
+  (check [vm ex cond a b]
+    (let [result (operation vm cond a b)]
+      (case result
+        true  vm
+        false (athrow vm ex)
+        (plus (record vm [true cond a b])
+              (m-> vm
+                   (record [false cond a b])
+                   (athrow ex))))))
+
+  (jump  [vm label]
+    (assoc-in vm [:method :pc] label))
+  
+  (jump  [vm label cond a]
+    (let [result (operation vm cond a)]
+      (case result
+        true   (jump vm label)
+        false  vm
+        (plus (record vm [false cond a])
+              (m-> vm
+                   (record [true cond a])
+                   (jump label))))))
+  
+  (jump  [vm label cond a b]
+    (let [result (operation vm cond a b)]
+      (case result
+        true   (jump vm label)
+        false  vm
+        (plus (record vm [false cond a b])
+              (m-> vm
+                   (record [true cond a b])
+                   (jump label))))))
+  
+  (invoke [vm callee args]
+    (if (border? callee)
       (let [result (lvar)]
-        (-> caller
-            (condition  [:invoke result method args])
-            (push-stack result)))
-      (let [callee  (run (VirtualMachine. heap
-                                          (vec args)
-                                          '()
-                                          events
-                                          border?
-                                          method
-                                          0)
-                      method 0)]
-        (let [{:keys [heap stack events]} callee]
-          (assoc caller
-                 :heap   heap
-                 :events events
-                 :stack  (concat stack (:stack caller)))))))
+        (m-> vm
+             (record  [:invoke result (select-keys callee
+                                                   [:method/class-name
+                                                    :method/name
+                                                    :method/type])
+                       args])
+             (push-stack result)))
+      (assoc vm
+             :method  (assoc callee
+                             :pc    -1 ;;-1 because step
+                             :local args)
+             :stack   (conj stack method))))
+  
+  (return [vm]
+    (if (empty? stack)
+      vm
+      (let [top   (peek stack)
+            stack (pop stack)]
+        (assoc vm
+               :method method
+               :stack  stack))))
 
-  (athrow [vm ex]
-    (assoc vm :exception ex))
- 
-  IBind
-  (bind [m f]
-    (f m))
-  (stream [m]
-    [m]))
+  (athrow [vm {thrown-type ::type :as ex}]
+    ;; TODO implement subclass predicate
+    (let [{pc        :pc
+           trycatchs :method/trycatch}  method
+          {:trycatch/keys [handler]}   (some (fn [{:trycatch/keys [start end type]}] 
+                                               (and (< start pc end)
+                                                    (= type thrown-type)))
+                                             trycatchs)]
+      (if handler
+        (assoc-in vm [:method :pc] handler)
+        (m-> (assoc vm :exception ex)
+             (clear-stack)
+             (return))))))
 
-(defn vm []
-  (VirtualMachine. {} [] '() [] (constantly true)))
+(defn parse-class-name [name]
+  (second (re-matches #"L([^;]+);" name)))
 
-(defn step [vm method pc]
-  (let [insn (nth (:method/instructions method) pc)]
-    (case (:kind (meta insn))              
-      :control      (control-op vm insn method pc)
-      :stack        (stack-op vm insn)
-      :heap         (heap-op  vm insn) 
-      :nop          vm)))
+(defn vm [method]
+  (let [
+        {[ret args] :method/type
+         access     :method/access
+         class-name :method/class-name } method
+        ]
+    (map->VirtualMachine {:heap  {}
+                          :stack []
+                          :method  (assoc method
+                                          :pc 0
+                                          :local (mapv (fn [class-name]
+                                                         (if-let [class-name (parse-class-name class-name)]
+                                                           (into {}
+                                                                 (map (fn [n]
+                                                                        [n (lvar)])
+                                                                      (keys (:class/fields
+                                                                             (class-by-name
+                                                                              class-name)))))
+                                                           (lvar)))
+                                                       (if (access :static)
+                                                         args
+                                                         (cons class-name
+                                                               args))))
+                          :border? (constantly true)
+                          :conditions []})))
 
-(defn run [vm method pc]
-  (let [insns (:method/instructions method)
-        size  (count insns)]
-    (loop [vm vm
-           pc pc]
-      (if (>= pc size) 
-        vm
-        (let [vm' (step vm method pc)]
-          (if (instance? Choice vm')
-            vm'
-            (recur vm'
-                   (inc pc))))))))
 
-(defn run-method [{[_ args] :type :as method}]
-  (let [vm (assoc (vm)
-                  :local [(lvar) (lvar)])]
-    (run vm method 0)))
-
+(defn run [method]
+  (loop [vm (vm method)
+         i  0]
+    (let [vm' (try
+                (bind vm step)
+                (catch Exception e
+                  (throw (ex-info "VM Crash" vm e))))]
+      (if (or (> i 100)
+              (= vm' vm))
+        vm'
+        (recur vm'
+               (inc i))))))
 
 
 

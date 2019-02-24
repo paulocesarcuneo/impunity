@@ -25,11 +25,14 @@ public class Domain {
     }
 
     public Out complexLogic(In in) {
+	try {
 	if(in.getA() > 100) {
 	    dep.doStuff();
 	    return new Out(in.getA());
 	}
 	return new Out(0);
-	
+	}catch (Exception e) {
+	    return null;
+	}
     }
 }

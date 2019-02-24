@@ -30,3 +30,6 @@
                    (map #(-> % first eval-dispatch (list (second %))))
                    (mapcat identity))
            default))))
+
+(defn tacnoc [tail head]
+  (apply list (concat head tail)))

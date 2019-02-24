@@ -43,11 +43,8 @@ DONE:
 "
 
 
-#_(let [class (asm/class-node-from-loader "Domain")
-                     method (get-in class [:class/methods "complexLogic"])]
-  (nth (iterate vm/step (vm/vm method)) 9))
+#_(let [method (asm/load-method "Domain" "complexLogic" ["LIn;"])]
+    (nth (iterate #(m/bind % vm/step) (vm/vm method)) 15))
 
-(let [class  (asm/class-node-from-loader "Domain")
-      method (get-in class [:class/methods "complexLogic"])]
-  (vm/run (vm/vm) method 0))
-
+(let [method (asm/load-method "Domain" "complexLogic" ["LIn;"])]
+                 (vm/run method))

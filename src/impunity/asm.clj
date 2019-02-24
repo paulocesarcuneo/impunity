@@ -26,6 +26,7 @@
             LocalVariableNode
             IntInsnNode
             TypeInsnNode
+            TryCatchBlockNode
             FrameNode])
   (:gen-class))
 
@@ -252,21 +253,21 @@
            Opcodes/IXOR  (kind  :stack [:xor  "I"])
            Opcodes/LXOR  (kind  :stack [:xor  "L"])
       
-           Opcodes/I2L (kind :stack [:2  "I" "L"])
-           Opcodes/I2F (kind :stack [:2  "I" "F"])
-           Opcodes/I2D (kind :stack [:2  "I" "D"])
-           Opcodes/L2I (kind :stack [:2  "L" "I"])
-           Opcodes/L2F (kind :stack [:2  "L" "F"])
-           Opcodes/L2D (kind :stack [:2  "L" "D"])
-           Opcodes/F2I (kind :stack [:2  "F" "I"])
-           Opcodes/F2L (kind :stack [:2  "F" "L"])
-           Opcodes/F2D (kind :stack [:2  "F" "D"])
-           Opcodes/D2I (kind :stack [:2  "D" "I"])
-           Opcodes/D2L (kind :stack [:2  "D" "L"])
-           Opcodes/D2F (kind :stack [:2  "D" "F"])
-           Opcodes/I2B (kind :stack [:2  "I" "B"])
-           Opcodes/I2C (kind :stack [:2  "I" "C"])
-           Opcodes/I2S (kind :stack [:2  "I" "S"])
+           Opcodes/I2L (kind :stack [:cast  "I" "L"])
+           Opcodes/I2F (kind :stack [:cast  "I" "F"])
+           Opcodes/I2D (kind :stack [:cast  "I" "D"])
+           Opcodes/L2I (kind :stack [:cast  "L" "I"])
+           Opcodes/L2F (kind :stack [:cast  "L" "F"])
+           Opcodes/L2D (kind :stack [:cast  "L" "D"])
+           Opcodes/F2I (kind :stack [:cast  "F" "I"])
+           Opcodes/F2L (kind :stack [:cast  "F" "L"])
+           Opcodes/F2D (kind :stack [:cast  "F" "D"])
+           Opcodes/D2I (kind :stack [:cast  "D" "I"])
+           Opcodes/D2L (kind :stack [:cast  "D" "L"])
+           Opcodes/D2F (kind :stack [:cast  "D" "F"])
+           Opcodes/I2B (kind :stack [:cast  "I" "B"])
+           Opcodes/I2C (kind :stack [:cast  "I" "C"])
+           Opcodes/I2S (kind :stack [:cast  "I" "S"])
       
            Opcodes/LCMP   (kind :stack [:cmp  "L"])      
            Opcodes/FCMPL  (kind :stack [:cmpl "F"])    
@@ -287,13 +288,30 @@
            Opcodes/MONITORENTER (kind :control [:monitor :enter])
            Opcodes/MONITOREXIT  (kind :control [:monitor :exit]))))
 
-(defn method-node [^MethodNode method]
+(defn field-node [^FieldNode field]
+  #:field
+  {:name      (.name field)
+   :access    (access-flags (.access field))
+   :type      (parse-type (.desc field))
+   :signature (.signature field)
+   :value     (.value field)})
+
+(defn catch-node [^TryCatchBlockNode catchnode
+                  labels]
+  #:trycatch
+  {:start   (labels (.start catchnode))
+   :end     (labels (.end   catchnode))
+   :handler (labels (.handler catchnode))
+   :type    (.type catchnode)})
+
+(defn method-node [^MethodNode method class-name]
   (let[access         (.access method)
        method-name    (.name method)                        
        localVariables (.localVariables method)
        method-type    (.desc method)
        ret            (parse-type (.getDescriptor (Type/getReturnType method-type)))
-       args           (map #(parse-type (.getDescriptor %)) (Type/getArgumentTypes method-type))
+       args           (mapv #(parse-type (.getDescriptor %))
+                            (Type/getArgumentTypes method-type))
        instructions   (->> method
                            .instructions
                            .iterator
@@ -310,8 +328,10 @@
     #:method
     {:access       (access-flags access)
      :name         method-name
+     :class-name   class-name 
      :type         [ret args]
      :signature    (.signature method)
+     :trycatch     (map #(catch-node % labels) (.tryCatchBlocks method))
      :instructions (->> instructions
                         (map (fn [[name label :as insn]]
                                (if (instance? LabelNode label)
@@ -319,40 +339,51 @@
                                  insn)))
                         vec)}))
 
-(defn field-node [^FieldNode field]
-  #:field
-  {:name   (.name field)
-   :access (access-flags (.access field))
-   :type   (parse-type (.desc field))
-   :signature (.signature field)
-   :value  (.value field)})
-
 (defn class-node [^ClassNode class-node]
   (let [class-name (.name class-node)
         this-type  (str "L" class-name ";")]
     #:class
-    {:name    class-name
-     :access  (access-flags
-               (.access class-node))
-     :type    this-type
-     :super   (str "L" (.-superName class-node) ";")
+    {:name       class-name
+     :access     (access-flags (.access class-node))
+     :type       this-type
+     :super      (str "L" (.-superName class-node) ";")
      :interfaces (.-interfaces class-node)
      :signature  (.-signature class-node)
-     :fields  (into {}
-                    (for [{field-name :field/name
-                           :as field}
-                          (map field-node
-                               (.fields class-node))]
-                      [field-name field]))
-     :methods (into {}
-                    (for [{method-name :method/name
-                           :as method}
-                          (map method-node
-                               (.methods class-node))]
-                      [method-name method]))}))
+     :fields     (into {}
+                       (for [{field-name :field/name
+                              :as field}
+                             (map field-node
+                                  (.fields class-node))]
+                         [field-name field]))
+     :methods    (into {}
+                       (for [{method-name :method/name
+                              [_ pars]        :method/type
+                              :as method}
+                             (map #(method-node % class-name)
+                                  (.methods class-node))]
+                         [[method-name pars] method]))}))
 
-(defn class-node-from-loader [class-name]
+(def class-lib (atom {}))
+
+(defn class-from-loader [class-name]
   (let [rdr        (ClassReader. class-name)
-        classNode  (ClassNode.)]
-    (.accept rdr classNode Opcodes/ASM5)
-    (class-node classNode)))
+        classNode  (ClassNode.)
+        _          (.accept rdr classNode Opcodes/ASM5)
+        class-node (class-node classNode)]
+    class-node))
+
+(defn class-by-name [class-name]
+  (let [class (get @class-lib class-name)]
+    (if class
+      class
+      (let [class-node (class-from-loader class-name)]
+        (swap! class-lib assoc class-name class-node)
+        class-node))))
+
+(defn load-method [class-name
+                   method-name
+                   method-args-type]
+  (let [class (class-by-name class-name)]
+    (get-in class
+            [:class/methods [method-name method-args-type]])))
+
